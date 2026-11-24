@@ -1,0 +1,36 @@
+from prometheus_client import Counter, Gauge, Histogram
+
+TASKS_SUBMITTED = Counter(
+    "coffee_scheduler_tasks_submitted_total",
+    "Total number of tasks submitted",
+    ["queue"],
+)
+TASKS_PULLED = Counter(
+    "coffee_scheduler_tasks_pulled_total",
+    "Total number of tasks pulled by workers",
+    ["queue"],
+)
+TASKS_ACKED = Counter(
+    "coffee_scheduler_tasks_acked_total",
+    "Total number of tasks acknowledged as succeeded",
+    ["queue"],
+)
+TASKS_NACKED = Counter(
+    "coffee_scheduler_tasks_nacked_total",
+    "Total number of tasks nacked or reaped",
+    ["queue", "outcome"],
+)
+QUEUE_READY_GAUGE = Gauge(
+    "coffee_scheduler_queue_ready_size",
+    "Current ready queue depth",
+    ["queue"],
+)
+QUEUE_DLQ_GAUGE = Gauge(
+    "coffee_scheduler_queue_dlq_size",
+    "Current dead-letter queue depth",
+    ["queue"],
+)
+FLUSHER_BATCH_HISTOGRAM = Histogram(
+    "coffee_scheduler_flusher_batch_size",
+    "Batch size flushed to MySQL",
+)
