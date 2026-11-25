@@ -19,8 +19,7 @@ for _, task_id in ipairs(items) do
     local queue = fields[1]
     if queue and queue ~= false then
         local prio = tonumber(fields[2]) or 5
-        local score = (9 - prio) * 10000000000000 + now_ms
-        redis.call("ZADD", prefix .. ":ready:" .. queue, score, task_id)
+        enqueue_ready(prefix .. ":ready:" .. queue, task_id, prio, now_ms)
         redis.call("SADD", prefix .. ":queues", queue)
         redis.call("HSET", task_key, "status", "READY")
     end

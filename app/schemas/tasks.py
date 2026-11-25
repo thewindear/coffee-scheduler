@@ -125,4 +125,4 @@ class QueueStatsResponse(BaseModel):
     ready_count: int
     running_count: int
     dlq_count: int
-    active_workers: int
+    worker_count: int

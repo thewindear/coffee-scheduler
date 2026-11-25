@@ -1,14 +1,17 @@
 import asyncio
 import logging
 import time
+from contextlib import suppress
 from datetime import UTC, datetime
 
 from croniter import croniter
+from redis.exceptions import LockNotOwnedError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.core.db import ensure_task_records_partitions
+from app.core.metrics import TASKS_NACKED
 from app.core.redis_client import RedisLuaManager
 from app.models.tables import CronJob
 from app.schemas.tasks import TaskSubmitRequest
@@ -16,6 +19,7 @@ from app.services.dispatcher import TaskDispatcher, _decode
 from app.services.flusher import AsyncFlusher
 
 logger = logging.getLogger(__name__)
+CRON_LOCK_SECONDS = 5
 
 
 class SchedulerEngine:
@@ -77,11 +81,12 @@ class SchedulerEngine:
                 reaped_total += 1
                 tid = _decode(row[0])
                 outcome = _decode(row[1])
+                TASKS_NACKED.labels(queue=queue, outcome=outcome).inc()
                 rc = int(_decode(row[2]))
                 wid = _decode(row[3]) or "unknown"
                 if outcome == "DEAD":
                     snapshot = await self.redis.hgetall(self.redis_mgr.task_key(tid))
-                    self.dispatcher._enqueue_terminal_flush(
+                    await self.dispatcher._enqueue_terminal_flush(
                         tid,
                         snapshot,
                         "DEAD",
@@ -94,10 +99,31 @@ class SchedulerEngine:
 
     async def scan_cron_once(self) -> int:
         lock_key = f"{self.redis_mgr.prefix}:lock:cron_scanner"
-        acquired = await self.redis.set(lock_key, "1", nx=True, px=5000)
-        if not acquired:
+        lock = self.redis.lock(lock_key, timeout=CRON_LOCK_SECONDS)
+        if not await lock.acquire(blocking=False):
             return 0
 
+        finished = asyncio.Event()
+
+        async def renew_lock() -> None:
+            while not finished.is_set():
+                try:
+                    await asyncio.wait_for(finished.wait(), timeout=CRON_LOCK_SECONDS / 3)
+                except TimeoutError:
+                    await lock.reacquire()
+
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(renew_lock())
+                try:
+                    return await self._scan_due_jobs()
+                finally:
+                    finished.set()
+        finally:
+            with suppress(LockNotOwnedError):
+                await lock.release()
+
+    async def _scan_due_jobs(self) -> int:
         now_ms = int(time.time() * 1000)
         now_dt = datetime.fromtimestamp(now_ms / 1000.0, tz=UTC)
         triggered = 0
@@ -114,7 +140,6 @@ class SchedulerEngine:
                 )
                 res = await session.execute(upd)
                 if res.rowcount == 1:
-                    await session.commit()
                     await self.dispatcher.submit_task(
                         TaskSubmitRequest(
                             queue=job.queue,
@@ -122,8 +147,10 @@ class SchedulerEngine:
                             priority=job.priority,
                             max_retries=job.max_retries,
                             lease_seconds=job.lease_seconds,
-                        )
+                        ),
+                        cron_occurrence=(job.id, job.next_run_at),
                     )
+                    await session.commit()
                     triggered += 1
                 else:
                     await session.rollback()

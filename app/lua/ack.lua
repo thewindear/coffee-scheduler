@@ -11,8 +11,9 @@ local hash_ttl_sec = tonumber(ARGV[3])
 local receipt_json = ARGV[4]
 local worker_id = ARGV[5]
 
-local status = redis.call("HGET", KEYS[2], "status")
-if not status or status ~= "RUNNING" then
+local state = redis.call("HMGET", KEYS[2], "status", "worker_id")
+local expires_at = tonumber(redis.call("ZSCORE", KEYS[1], task_id))
+if state[1] ~= "RUNNING" or state[2] ~= worker_id or not expires_at or expires_at <= now_ms then
     return 0
 end
 

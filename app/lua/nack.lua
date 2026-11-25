@@ -17,9 +17,9 @@ local hash_ttl_sec = tonumber(ARGV[5])
 local receipt_json = ARGV[6]
 local worker_id = ARGV[7]
 
-local vals = redis.call("HMGET", KEYS[2], "status", "retry_count", "max_retries")
-local status = vals[1]
-if not status or status ~= "RUNNING" then
+local vals = redis.call("HMGET", KEYS[2], "status", "retry_count", "max_retries", "worker_id")
+local expires_at = tonumber(redis.call("ZSCORE", KEYS[1], task_id))
+if vals[1] ~= "RUNNING" or vals[4] ~= worker_id or not expires_at or expires_at <= now_ms then
     return {"IGNORED", 0, 0}
 end
 

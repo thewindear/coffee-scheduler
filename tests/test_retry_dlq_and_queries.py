@@ -70,7 +70,7 @@ async def test_nack_retry_dlq_and_batch_retry(app_bundle):
     # Check queue stats
     stats = (await client.get("/api/v1/queues/dlq_q/stats")).json()
     assert stats["dlq_count"] == 2
-    assert stats["active_workers"] == 1
+    assert stats["worker_count"] == 1
 
     # Batch retry DLQ
     batch_retry = await client.post("/api/v1/dlq/dlq_q/retry", json={"limit": 10})

@@ -5,7 +5,7 @@
 
 #### Scenario: 提交即时任务
 - **WHEN** 生产端调用 `POST /api/v1/tasks` 且未指定未来执行时间（`delay_seconds=0` 且无 `run_at`）
-- **THEN** 系统生成唯一 `task_id`，将任务元数据（含 `priority`）写入 `cs:task:{task_id}`，并按 `(9 - priority) * 1e13 + now_ms` 计算分值写入对应队列 `cs:ready:{queue}`
+- **THEN** 系统生成唯一 `task_id`，将任务元数据（含 `priority`）写入 `cs:task:{task_id}`，以 `(9 - priority) * 1e13 + now_ms` 为基础分值写入 `cs:ready:{queue}`，并确保新任务排在已就绪的同优先级任务之后
 - **AND** 将创建事件投递至异步刷盘队列等待写入 MySQL
 
 #### Scenario: 提交延迟任务并到期搬运

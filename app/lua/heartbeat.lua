@@ -24,8 +24,8 @@ if current_worker ~= worker_id then
     return -1
 end
 
-local in_lease = redis.call("ZSCORE", KEYS[1], task_id)
-if not in_lease then
+local expires_at = tonumber(redis.call("ZSCORE", KEYS[1], task_id))
+if not expires_at or expires_at <= now_ms then
     return 0
 end
 

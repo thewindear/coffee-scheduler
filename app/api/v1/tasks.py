@@ -1,6 +1,10 @@
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
+from fastapi.routing import APIRoute
+from starlette.types import Message
 
 from app.api.deps import get_dispatcher
 from app.schemas.tasks import (
@@ -23,6 +27,38 @@ from app.schemas.tasks import (
 from app.services.dispatcher import TaskDispatcher
 
 router = APIRouter(prefix="/api/v1", tags=["tasks"])
+
+
+class ReceiptRoute(APIRoute):
+    def get_route_handler(self) -> Callable[[Request], Awaitable[Response]]:
+        handler = super().get_route_handler()
+
+        async def limited_handler(request: Request) -> Response:
+            limit = request.app.state.settings.max_receipt_bytes
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > limit:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Receipt exceeds {limit} bytes. Store large data externally and pass artifact references.",
+                    )
+                body.extend(chunk)
+
+            buffered: bytes | None = bytes(body)
+
+            async def receive() -> Message:
+                nonlocal buffered
+                if buffered is None:
+                    return await request.receive()
+                chunk, buffered = buffered, None
+                return {"type": "http.request", "body": chunk}
+
+            return await handler(Request(request.scope, receive))
+
+        return limited_handler
+
+
+receipt_router = APIRouter(route_class=ReceiptRoute)
 
 
 @router.post("/tasks", response_model=TaskSubmitResponse)
@@ -59,7 +95,7 @@ async def heartbeat_task(
     return await dispatcher.heartbeat(task_id, req)
 
 
-@router.post("/tasks/{task_id}/ack")
+@receipt_router.post("/tasks/{task_id}/ack")
 async def ack_task(
     task_id: str,
     req: TaskAckRequest,
@@ -68,7 +104,7 @@ async def ack_task(
     return await dispatcher.ack_task(task_id, req)
 
 
-@router.post("/tasks/{task_id}/nack", response_model=TaskNackResponse)
+@receipt_router.post("/tasks/{task_id}/nack", response_model=TaskNackResponse)
 async def nack_task(
     task_id: str,
     req: TaskNackRequest,
@@ -131,3 +167,6 @@ async def retry_dlq_batch(
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> list[TaskSubmitResponse]:
     return await dispatcher.retry_dlq_batch(queue, req or DlqBatchRetryRequest())
+
+
+router.include_router(receipt_router)

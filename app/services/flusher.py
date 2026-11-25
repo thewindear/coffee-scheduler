@@ -6,7 +6,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.core.metrics import FLUSHER_BATCH_HISTOGRAM
+from app.core.metrics import FLUSHER_BATCH_HISTOGRAM, FLUSHER_DURATION
 from app.models.tables import TaskRecord
 
 logger = logging.getLogger(__name__)
@@ -27,15 +27,15 @@ class AsyncFlusher:
         self.batch_size = batch_size
         self.flush_interval_s = flush_interval_ms / 1000.0
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50000)
+        self._pending: list[dict[str, Any]] = []
         self._flush_lock = asyncio.Lock()
+        self._wake = asyncio.Event()
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
-    def enqueue(self, record: dict[str, Any]) -> None:
-        try:
-            self.queue.put_nowait(record)
-        except asyncio.QueueFull:
-            logger.warning("AsyncFlusher queue full; dropping record task_id=%s", record.get("task_id"))
+    async def enqueue(self, record: dict[str, Any]) -> None:
+        await self.queue.put(record)
+        self._wake.set()
 
     async def flush_batch(self, records: list[dict[str, Any]]) -> None:
         if not records:
@@ -44,10 +44,7 @@ class AsyncFlusher:
         merged: dict[tuple[str, Any], dict[str, Any]] = {}
         for rec in records:
             key = (rec["task_id"], rec["created_at"])
-            if key in merged:
-                merged[key].update({k: v for k, v in rec.items() if v is not None})
-            else:
-                merged[key] = dict(rec)
+            merged[key] = rec
 
         rows = list(merged.values())
         FLUSHER_BATCH_HISTOGRAM.observe(len(rows))
@@ -59,11 +56,12 @@ class AsyncFlusher:
             "receipt",
             "retry_count",
             "worker_id",
+            "scheduled_at",
             "pulled_at",
             "finished_at",
         ]
         dialect = self.engine.dialect.name
-        async with self._flush_lock:
+        with FLUSHER_DURATION.time():
             async with self.session_factory() as session:
                 if dialect == "mysql":
                     stmt = mysql_insert(TaskRecord).values(rows)
@@ -80,39 +78,44 @@ class AsyncFlusher:
                 await session.commit()
 
     async def drain_once(self) -> int:
-        batch: list[dict[str, Any]] = []
-        while len(batch) < self.batch_size:
-            try:
-                batch.append(self.queue.get_nowait())
-            except asyncio.QueueEmpty:
-                break
-        if batch:
-            await self.flush_batch(batch)
-        else:
-            # Wait for any in-flight background flush_batch to finish committing
-            async with self._flush_lock:
-                pass
-        return len(batch)
+        async with self._flush_lock:
+            if not self._pending:
+                for _ in range(min(self.batch_size, self.queue.qsize())):
+                    self._pending.append(self.queue.get_nowait())
+            await self.flush_batch(self._pending)
+            count = len(self._pending)
+            self._pending.clear()
+            return count
 
     async def _loop(self) -> None:
-        while not self._stop_event.is_set() or not self.queue.empty():
-            batch: list[dict[str, Any]] = []
-            try:
-                first = await asyncio.wait_for(self.queue.get(), timeout=self.flush_interval_s)
-                batch.append(first)
-            except TimeoutError:
-                continue
+        loop = asyncio.get_running_loop()
+        while not self._stop_event.is_set() or not self.queue.empty() or self._pending:
+            if self.queue.empty() and not self._pending:
+                self._wake.clear()
+                await self._wake.wait()
+                if self.queue.empty():
+                    continue
 
-            while len(batch) < self.batch_size:
+            deadline = loop.time() + self.flush_interval_s
+            while (
+                not self._pending
+                and self.queue.qsize() < self.batch_size
+                and not self._stop_event.is_set()
+            ):
+                self._wake.clear()
                 try:
-                    batch.append(self.queue.get_nowait())
-                except asyncio.QueueEmpty:
+                    async with asyncio.timeout_at(deadline):
+                        await self._wake.wait()
+                except TimeoutError:
                     break
 
             try:
-                await self.flush_batch(batch)
+                await self.drain_once()
             except Exception:
-                logger.exception("AsyncFlusher failed to flush batch of %d records", len(batch))
+                if self._stop_event.is_set():
+                    raise
+                logger.exception("AsyncFlusher will retry %d records", len(self._pending))
+                await asyncio.sleep(self.flush_interval_s)
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -121,6 +124,7 @@ class AsyncFlusher:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        self._wake.set()
         if self._task is not None:
             await self._task
             self._task = None

@@ -85,6 +85,7 @@ cp .env.example .env
 ### 4. 启动服务
 
 ```bash
+alembic upgrade head
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -264,9 +265,19 @@ curl http://localhost:8000/api/v1/queues/crawl/stats
   "ready_count": 1250,
   "running_count": 48,
   "dlq_count": 3,
-  "active_workers": 12
+  "worker_count": 12
 }
 ```
+
+## 并发压测
+
+从仓库根目录运行。脚本会核对拉取与提交的任务 ID、终态、回执和队列残留。
+
+```bash
+python -m scripts.bench_local --tasks 5000 --producers 16 --workers 16
+```
+
+默认使用内存中的 FakeRedis 和 SQLite。加上 `--real` 可通过 `REDIS_URL` 和 `MYSQL_DSN` 使用真实服务。真实模式会创建独立测试队列并写入任务记录，请使用测试实例。
 
 ## ⚙️ 配置参数
 

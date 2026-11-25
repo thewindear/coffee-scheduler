@@ -12,6 +12,8 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir .
 
 COPY app/ app/
+COPY alembic.ini ./
+COPY alembic/ alembic/
 
 # ---------- runtime ----------
 FROM python:3.12-slim

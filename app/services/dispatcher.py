@@ -46,8 +46,10 @@ def _decode(val: Any) -> str:
     return str(val)
 
 
-def _priority_score(priority: int, ready_at_ms: int) -> float:
-    return float((9 - priority) * 10_000_000_000_000 + ready_at_ms)
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
 
 
 def _encode_cursor(created_at: datetime, task_id: str) -> str:
@@ -59,7 +61,7 @@ def _decode_cursor(cursor: str) -> tuple[datetime, str]:
     try:
         raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
         ts_str, tid = raw.split("|", 1)
-        return datetime.fromisoformat(ts_str), tid
+        return _naive_utc(datetime.fromisoformat(ts_str)), tid
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid cursor") from exc
 
@@ -80,61 +82,67 @@ class TaskDispatcher:
         self.session_factory = session_factory
         self.settings = settings
 
-    async def submit_task(self, req: TaskSubmitRequest) -> TaskSubmitResponse:
+    async def _enqueue_task(
+        self,
+        task_id: str,
+        queue: str,
+        priority: int,
+        now_ms: int,
+        scheduled_at_ms: int,
+        fields: dict[str, str],
+        *,
+        idempotency_key: str | None = None,
+        retry: bool = False,
+    ) -> tuple[str, str, bool]:
+        keys = [
+            self.redis_mgr.task_key(task_id),
+            self.redis_mgr.ready_key(queue),
+            self.redis_mgr.delay_key(self.redis_mgr.delay_shard_for(task_id)),
+            self.redis_mgr.active_queues_key(),
+            self.redis_mgr.dlq_key(queue),
+        ]
+        if idempotency_key:
+            keys.append(idempotency_key)
+        result = await self.redis_mgr.get_script("enqueue")(
+            keys=keys,
+            args=[
+                self.redis_mgr.prefix, task_id, queue, priority, now_ms, scheduled_at_ms,
+                "retry" if retry else "submit", self.settings.idempotency_ttl_seconds,
+                *(value for pair in fields.items() for value in pair),
+            ],
+        )
+        return _decode(result[0]), _decode(result[1]), bool(result[2])
+
+    async def submit_task(
+        self, req: TaskSubmitRequest, *, cron_occurrence: tuple[int, int] | None = None
+    ) -> TaskSubmitResponse:
         now_ms = _now_ms()
         task_id = uuid7(now_ms)
-
-        if req.idempotency_key:
-            idemp_k = self.redis_mgr.idemp_key(req.idempotency_key)
-            acquired = await self.redis.set(
-                idemp_k, task_id, nx=True, ex=self.settings.idempotency_ttl_seconds
-            )
-            if not acquired:
-                existing_id = await self.redis.get(idemp_k)
-                if existing_id is not None:
-                    existing_str = _decode(existing_id)
-                    existing_status = await self.redis.hget(self.redis_mgr.task_key(existing_str), "status")
-                    return TaskSubmitResponse(
-                        task_id=existing_str,
-                        queue=req.queue,
-                        status=_decode(existing_status) if existing_status else "UNKNOWN",
-                        deduplicated=True,
-                    )
-
         scheduled_at_ms = req.run_at_ms if req.run_at_ms is not None else now_ms + req.delay_seconds * 1000
-        is_delayed = scheduled_at_ms > now_ms
-        initial_status = "DELAYED" if is_delayed else "READY"
-        payload_json = json.dumps(req.payload, separators=(",", ":"), ensure_ascii=False)
-        created_at = _ms_to_naive_utc(now_ms)
-
-        pipe = self.redis.pipeline(transaction=False)
-        task_k = self.redis_mgr.task_key(task_id)
-        pipe.hset(
-            task_k,
-            mapping={
+        idempotency_key = self.redis_mgr.idemp_key(req.idempotency_key) if req.idempotency_key else None
+        if cron_occurrence is not None:
+            job_id, due_at = cron_occurrence
+            idempotency_key = f"{self.redis_mgr.prefix}:cron_occurrence:{job_id}:{due_at}"
+        task_id, initial_status, created = await self._enqueue_task(
+            task_id, req.queue, req.priority, now_ms, scheduled_at_ms,
+            {
                 "task_id": task_id,
                 "queue": req.queue,
                 "priority": str(req.priority),
-                "status": initial_status,
                 "idempotency_key": req.idempotency_key or "",
-                "payload": payload_json,
+                "payload": json.dumps(req.payload, separators=(",", ":"), ensure_ascii=False),
                 "retry_count": "0",
                 "max_retries": str(req.max_retries),
                 "lease_ttl": str(req.lease_seconds),
                 "scheduled_at": str(scheduled_at_ms),
                 "created_at_ms": str(now_ms),
             },
+            idempotency_key=idempotency_key,
         )
-        pipe.sadd(self.redis_mgr.active_queues_key(), req.queue)
-        if is_delayed:
-            shard = self.redis_mgr.delay_shard_for(task_id)
-            pipe.zadd(self.redis_mgr.delay_key(shard), {task_id: scheduled_at_ms})
-        else:
-            score = _priority_score(req.priority, now_ms)
-            pipe.zadd(self.redis_mgr.ready_key(req.queue), {task_id: score})
-        await pipe.execute()
+        if not created:
+            return TaskSubmitResponse(task_id=task_id, queue=req.queue, status=initial_status, deduplicated=True)
 
-        self.flusher.enqueue(
+        await self.flusher.enqueue(
             {
                 "task_id": task_id,
                 "queue": req.queue,
@@ -148,7 +156,7 @@ class TaskDispatcher:
                 "scheduled_at": scheduled_at_ms,
                 "pulled_at": None,
                 "finished_at": None,
-                "created_at": created_at,
+                "created_at": _ms_to_naive_utc(now_ms),
             }
         )
         TASKS_SUBMITTED.labels(queue=req.queue).inc()
@@ -238,11 +246,6 @@ class TaskDispatcher:
             "extra": req.extra,
         }
         receipt_json = json.dumps(receipt_dict, separators=(",", ":"), ensure_ascii=False)
-        if len(receipt_json.encode("utf-8")) > self.settings.max_receipt_bytes:
-            raise HTTPException(
-                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                detail=f"Receipt payload exceeds {self.settings.max_receipt_bytes} bytes; store large data externally and pass artifacts URI",
-            )
 
         task_k = self.redis_mgr.task_key(task_id)
         snapshot = await self.redis.hgetall(task_k)
@@ -263,7 +266,7 @@ class TaskDispatcher:
                 detail="Task is not in RUNNING state",
             )
 
-        self._enqueue_terminal_flush(task_id, snapshot, "SUCCEEDED", receipt_dict, req.worker_id, now_ms)
+        await self._enqueue_terminal_flush(task_id, snapshot, "SUCCEEDED", receipt_dict, req.worker_id, now_ms)
         TASKS_ACKED.labels(queue=req.queue).inc()
         return {"task_id": task_id, "status": "SUCCEEDED"}
 
@@ -276,11 +279,6 @@ class TaskDispatcher:
             "retryable": req.retryable,
         }
         receipt_json = json.dumps(receipt_dict, separators=(",", ":"), ensure_ascii=False)
-        if len(receipt_json.encode("utf-8")) > self.settings.max_receipt_bytes:
-            raise HTTPException(
-                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-                detail=f"Nack payload exceeds {self.settings.max_receipt_bytes} bytes",
-            )
 
         task_k = self.redis_mgr.task_key(task_id)
         snapshot = await self.redis.hgetall(task_k)
@@ -313,7 +311,7 @@ class TaskDispatcher:
             )
 
         if outcome == "DEAD":
-            self._enqueue_terminal_flush(
+            await self._enqueue_terminal_flush(
                 task_id, snapshot, "DEAD", receipt_dict, req.worker_id, now_ms, retry_count=retry_count
             )
         TASKS_NACKED.labels(queue=req.queue, outcome=outcome).inc()
@@ -324,7 +322,7 @@ class TaskDispatcher:
             next_run_at_ms=ts_val if outcome == "RETRY" else None,
         )
 
-    def _enqueue_terminal_flush(
+    async def _enqueue_terminal_flush(
         self,
         task_id: str,
         snapshot: dict[Any, Any],
@@ -337,7 +335,7 @@ class TaskDispatcher:
         decoded = {_decode(k): _decode(v) for k, v in (snapshot or {}).items()}
         created_ms = int(decoded.get("created_at_ms") or extract_uuid7_timestamp_ms(task_id) or finished_at_ms)
         rc = retry_count if retry_count is not None else int(decoded.get("retry_count", 0))
-        self.flusher.enqueue(
+        await self.flusher.enqueue(
             {
                 "task_id": task_id,
                 "queue": decoded.get("queue", "default"),
@@ -416,8 +414,10 @@ class TaskDispatcher:
         limit: int = 50,
     ) -> TaskListResponse:
         now_utc = datetime.now(UTC).replace(tzinfo=None)
-        eff_end = end_time or now_utc
-        eff_start = start_time or (eff_end - timedelta(hours=24))
+        eff_end = _naive_utc(end_time) if end_time is not None else now_utc
+        eff_start = _naive_utc(start_time) if start_time is not None else eff_end - timedelta(hours=24)
+        if eff_start > eff_end:
+            raise HTTPException(status_code=400, detail="start_time must precede end_time")
         if (eff_end - eff_start) > timedelta(days=self.settings.max_query_span_days):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -480,16 +480,16 @@ class TaskDispatcher:
         ready_cnt, running_cnt, dlq_cnt = await pipe.execute()
 
         worker_pattern = f"{self.redis_mgr.prefix}:worker:{queue}:*"
-        active_workers = 0
+        worker_count = 0
         async for _ in self.redis.scan_iter(match=worker_pattern, count=100):
-            active_workers += 1
+            worker_count += 1
 
         return QueueStatsResponse(
             queue=queue,
             ready_count=int(ready_cnt),
             running_count=int(running_cnt),
             dlq_count=int(dlq_cnt),
-            active_workers=active_workers,
+            worker_count=worker_count,
         )
 
     async def retry_task(self, task_id: str, req: TaskRetryRequest) -> TaskSubmitResponse:
@@ -503,40 +503,27 @@ class TaskDispatcher:
         now_ms = _now_ms()
         new_priority = req.priority if req.priority is not None else detail.priority
         new_payload = req.payload if req.payload is not None else detail.payload
-        payload_json = json.dumps(new_payload, separators=(",", ":"), ensure_ascii=False)
         scheduled_at_ms = now_ms + req.delay_seconds * 1000
-        new_status = "DELAYED" if req.delay_seconds > 0 else "READY"
-
-        task_k = self.redis_mgr.task_key(task_id)
-        pipe = self.redis.pipeline(transaction=False)
-        pipe.lrem(self.redis_mgr.dlq_key(detail.queue), 0, task_id)
-        pipe.hset(
-            task_k,
-            mapping={
+        created_ms = extract_uuid7_timestamp_ms(task_id)
+        if created_ms is None:
+            created_ms = int(_naive_utc(detail.created_at).replace(tzinfo=UTC).timestamp() * 1000) if detail.created_at else now_ms
+        _, new_status, enqueued = await self._enqueue_task(
+            task_id, detail.queue, new_priority, now_ms, scheduled_at_ms,
+            {
                 "task_id": task_id,
                 "queue": detail.queue,
                 "priority": str(new_priority),
-                "status": new_status,
-                "payload": payload_json,
+                "payload": json.dumps(new_payload, separators=(",", ":"), ensure_ascii=False),
                 "retry_count": "0",
                 "scheduled_at": str(scheduled_at_ms),
-                "created_at_ms": str(
-                    int(detail.created_at.replace(tzinfo=UTC).timestamp() * 1000)
-                    if detail.created_at
-                    else now_ms
-                ),
+                "created_at_ms": str(created_ms),
             },
+            retry=True,
         )
-        pipe.persist(task_k)
-        if req.delay_seconds > 0:
-            shard = self.redis_mgr.delay_shard_for(task_id)
-            pipe.zadd(self.redis_mgr.delay_key(shard), {task_id: scheduled_at_ms})
-        else:
-            pipe.zadd(self.redis_mgr.ready_key(detail.queue), {task_id: _priority_score(new_priority, now_ms)})
-        await pipe.execute()
-
-        created_dt = detail.created_at or _ms_to_naive_utc(now_ms)
-        self.flusher.enqueue(
+        if not enqueued:
+            raise HTTPException(status_code=409, detail=f"Cannot retry task in status {new_status}")
+        created_dt = _ms_to_naive_utc(created_ms)
+        await self.flusher.enqueue(
             {
                 "task_id": task_id,
                 "queue": detail.queue,

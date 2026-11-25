@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from prometheus_fastapi_instrumentator import Instrumentator
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -9,6 +9,7 @@ from app.api.v1.cron_jobs import router as cron_router
 from app.api.v1.tasks import router as tasks_router
 from app.core.config import Settings, get_settings
 from app.core.db import create_db_engine, create_session_factory, init_db
+from app.core.metrics import refresh_queue_metrics
 from app.core.redis_client import RedisLuaManager
 from app.services.dispatcher import TaskDispatcher
 from app.services.flusher import AsyncFlusher
@@ -34,6 +35,7 @@ def create_app(
         redis_mgr = RedisLuaManager(
             r_client, prefix=cfg.redis_key_prefix, delay_shard_count=cfg.delay_shard_count
         )
+        await redis_mgr.preload_scripts()
         flusher = AsyncFlusher(
             engine=engine,
             session_factory=session_factory,
@@ -82,7 +84,9 @@ def create_app(
     application = FastAPI(title="Coffee Scheduler", version="0.1.0", lifespan=lifespan)
     application.include_router(tasks_router)
     application.include_router(cron_router)
-    Instrumentator().instrument(application).expose(application, endpoint="/metrics")
+    Instrumentator().instrument(application).expose(
+        application, endpoint="/metrics", dependencies=[Depends(refresh_queue_metrics)]
+    )
 
     @application.get("/health", tags=["health"])
     async def health() -> dict[str, str]:

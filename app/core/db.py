@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import text
+from sqlalchemy import Connection, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -24,50 +24,51 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessi
     return async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
-async def ensure_task_records_partitions(engine: AsyncEngine, days_ahead: int = 7) -> None:
-    """Ensure MySQL RANGE COLUMNS(created_at) partitions exist for today + days_ahead.
+def task_record_partition_definitions(days_ahead: int) -> dict[str, str]:
+    today = datetime.now(UTC).date()
+    definitions = {}
+    for offset in range(days_ahead + 1):
+        day = today + timedelta(days=offset)
+        name = f"p{day:%Y%m%d}"
+        definitions[name] = (
+            f"PARTITION {name} VALUES LESS THAN ('{day + timedelta(days=1):%Y-%m-%d} 00:00:00')"
+        )
+    return definitions
 
-    No-op for non-MySQL dialects (e.g., SQLite in unit tests).
-    """
-    if engine.dialect.name != "mysql":
-        return
 
-    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
-    async with engine.begin() as conn:
-        # Check whether task_records is already partitioned
-        res = await conn.execute(
-            text(
-                "SELECT PARTITION_NAME FROM information_schema.PARTITIONS "
-                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'task_records' "
-                "AND PARTITION_NAME IS NOT NULL"
+def partition_task_records_sql(definitions: dict[str, str]) -> str:
+    return f"ALTER TABLE task_records PARTITION BY RANGE COLUMNS(created_at) ({', '.join(definitions.values())})"
+
+
+def ensure_mysql_task_records_partitions(conn: Connection, days_ahead: int) -> None:
+    definitions = task_record_partition_definitions(days_ahead)
+    lock_name = "SHA2(CONCAT(DATABASE(), '/coffee_task_partitions'), 256)"
+    if conn.scalar(text(f"SELECT GET_LOCK({lock_name}, 10)")) != 1:
+        raise RuntimeError("Could not acquire task partition maintenance lock")
+    try:
+        existing = set(
+            conn.scalars(
+                text(
+                    "SELECT PARTITION_NAME FROM information_schema.PARTITIONS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'task_records' "
+                    "AND PARTITION_NAME IS NOT NULL"
+                )
             )
         )
-        existing = {row[0] for row in res.fetchall()}
-
         if not existing:
-            # Convert freshly created table into a daily RANGE COLUMNS(created_at) partitioned table
-            defs = []
-            for offset in range(days_ahead + 1):
-                day = today + timedelta(days=offset)
-                next_day = day + timedelta(days=1)
-                pname = f"p{day.strftime('%Y%m%d')}"
-                defs.append(
-                    f"PARTITION {pname} VALUES LESS THAN ('{next_day.strftime('%Y-%m-%d 00:00:00')}')"
-                )
-            sql = f"ALTER TABLE task_records PARTITION BY RANGE COLUMNS(created_at) ({', '.join(defs)})"
-            await conn.execute(text(sql))
+            conn.execute(text(partition_task_records_sql(definitions)))
             return
+        for name, definition in definitions.items():
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE task_records ADD PARTITION ({definition})"))
+    finally:
+        conn.execute(text(f"SELECT RELEASE_LOCK({lock_name})"))
 
-        for offset in range(days_ahead + 1):
-            day = today + timedelta(days=offset)
-            next_day = day + timedelta(days=1)
-            pname = f"p{day.strftime('%Y%m%d')}"
-            if pname not in existing:
-                sql = (
-                    f"ALTER TABLE task_records ADD PARTITION ("
-                    f"PARTITION {pname} VALUES LESS THAN ('{next_day.strftime('%Y-%m-%d 00:00:00')}'))"
-                )
-                await conn.execute(text(sql))
+
+async def ensure_task_records_partitions(engine: AsyncEngine, days_ahead: int = 7) -> None:
+    if engine.dialect.name == "mysql":
+        async with engine.begin() as conn:
+            await conn.run_sync(ensure_mysql_task_records_partitions, days_ahead)
 
 
 async def init_db(engine: AsyncEngine, days_ahead: int = 7) -> None:

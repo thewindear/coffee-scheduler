@@ -1,7 +1,7 @@
 from pathlib import Path
-from typing import Any
 
 from redis.asyncio import Redis
+from redis.commands.core import AsyncScript
 
 LUA_DIR = Path(__file__).resolve().parent.parent / "lua"
 
@@ -13,7 +13,7 @@ class RedisLuaManager:
         self.redis = redis
         self.prefix = prefix
         self.delay_shard_count = delay_shard_count
-        self._scripts: dict[str, Any] = {}
+        self._scripts: dict[str, AsyncScript] = {}
 
     def task_key(self, task_id: str) -> str:
         return f"{self.prefix}:task:{task_id}"
@@ -42,9 +42,17 @@ class RedisLuaManager:
     def active_queues_key(self) -> str:
         return f"{self.prefix}:queues"
 
-    def get_script(self, name: str) -> Any:
+    async def preload_scripts(self) -> None:
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for path in sorted(LUA_DIR.glob("[!_]*.lua")):
+                pipe.script_load(self.get_script(path.stem).script)
+            await pipe.execute()
+
+    def get_script(self, name: str) -> AsyncScript:
         if name not in self._scripts:
             lua_path = LUA_DIR / f"{name}.lua"
             source = lua_path.read_text(encoding="utf-8")
+            if name in {"enqueue", "pump"}:
+                source = (LUA_DIR / "_ready.lua").read_text(encoding="utf-8") + "\n" + source
             self._scripts[name] = self.redis.register_script(source)
         return self._scripts[name]

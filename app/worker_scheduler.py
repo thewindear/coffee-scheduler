@@ -20,6 +20,7 @@ async def run_worker_scheduler() -> None:
     redis_mgr = RedisLuaManager(
         r_client, prefix=cfg.redis_key_prefix, delay_shard_count=cfg.delay_shard_count
     )
+    await redis_mgr.preload_scripts()
     flusher = AsyncFlusher(
         engine=engine,
         session_factory=session_factory,

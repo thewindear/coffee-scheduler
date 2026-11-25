@@ -35,11 +35,12 @@ flowchart LR
 | `cs:task:{task_id}` | Hash | 存储 `queue`, `priority`, `payload`, `status`, `retry_count`, `max_retries`, `lease_ttl`, `created_at` | 终态后设置 TTL（如 24h）自动淘汰 |
 | `cs:idemp:{key}` | String | 幂等键防重，值为 `task_id` | 提交时 `SET NX EX`（如 24h） |
 | `cs:delay:{shard}` | ZSET | 延迟/重试任务队列，`member=task_id`, `score=next_run_at_ms`（按 `task_id` hash 分 16 片） | `pump.lua` 到期弹出 |
-| `cs:ready:{queue}` | ZSET | 按业务 `queue` 隔离的就绪优先级队列，`score = (9 - priority) * 1e13 + ready_at_ms`（支持 0~9 级，同优先级按时间 FIFO，53-bit float 精度安全） | `pull.lua` 通过 `ZPOPMIN` 弹出 |
+| `cs:ready:{queue}` | ZSET | 按业务 `queue` 隔离的就绪优先级队列。基础分值为 `(9 - priority) * 1e13 + ready_at_ms`。若同优先级已有不低于该分值的任务，取该优先级最大分值加 `1/64`，保证同优先级按入队顺序拉取。 | `pull.lua` 通过 `ZPOPMIN` 弹出 |
 | `cs:lease:{queue}` | ZSET | 已拉取执行中的任务，`member=task_id`, `score=expire_at_ms` | `ack`/`nack` 移出，或 `lease_reap.lua` 超时回收 |
 | `cs:dlq:{queue}` | List | 超过最大重试次数的死信任务 ID | 人工排查/重跑后清理 |
 
 ### 核心 Lua 脚本职责
+- **`enqueue.lua`**：在同一个原子操作中检查幂等键、写入任务 Hash，并将任务投入延迟或就绪队列；支持终态任务手动重跑。
 - **`pump.lua`**：从 `cs:delay:{shard}` 取出 `score <= now_ms` 的批量任务（如每次最多 200 条），将其从 ZSET 移除并按任务的 `priority` 计算复合分值写入 `cs:ready:{queue}`，更新任务状态为 `READY`。
 - **`pull.lua`**：从 `cs:ready:{queue}` 使用 `ZPOPMIN` 原子弹出最多 `batch_size` 条最高优先级任务，写入 `cs:lease:{queue}`（`score = now_ms + lease_ttl * 1000`），更新任务状态为 `RUNNING` 并返回任务详情。
 - **`heartbeat.lua`**：校验任务处于 `RUNNING` 且归属当前 `worker_id`（可选），刷新 `cs:lease:{queue}` 的 `score`。
@@ -52,7 +53,7 @@ flowchart LR
 - 字段：`id`, `name`, `queue`, `priority`, `cron_expr`, `payload (JSON)`, `max_retries`, `lease_seconds`, `enabled`, `next_run_at`, `version`, `created_at`, `updated_at`
 - 通过乐观锁或 Scheduler 主节点锁保证每次到期只生成一条任务实例。
 
-### `task_records_YYYYMMDD` 表（按天分表流水）
+### `task_records` 表（按天分区流水）
 - 字段：`task_id (PK)`, `queue`, `priority`, `status`, `payload (JSON)`, `receipt (JSON, ≤16KB)`, `retry_count`, `worker_id`, `scheduled_at`, `finished_at`, `created_at`
 - **异步批量刷盘（Async Flusher）**：API 与 Scheduler 将需要落库的事件（创建、终态、死信）放入内存异步队列（`asyncio.Queue`），后台协程每 `100ms` 或累积 `500` 条执行一次 `INSERT ... ON DUPLICATE KEY UPDATE` 批量写入 MySQL。
 
@@ -108,4 +109,4 @@ flowchart LR
 - **API 服务**：完全无状态，可通过 Uvicorn/Gunicorn 多 Worker + 多容器水平扩展。
 - **Scheduler 引擎**：
   - 本地开发：通过配置项 `EMBEDDED_SCHEDULER=true` 在 FastAPI `lifespan` 中随进程启动。
-  - 生产部署：关闭内嵌模式，独立运行 `python -m app.worker_scheduler` 多实例，通过 Redis 分布式锁（`SET lock:scheduler NX PX` + 自动续期）选主运行 Cron Scanner，Delay Pump 与 Lease Reaper 可按 `shard`/`queue` 分片并行。
+  - 生产部署：关闭内嵌模式，独立运行 `python -m app.worker_scheduler` 多实例，通过 Redis 分布式锁（`SET cs:lock:cron_scanner NX PX` + 持有者自动续期）选主运行 Cron Scanner，Delay Pump 与 Lease Reaper 可按 `shard`/`queue` 分片并行。
