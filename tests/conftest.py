@@ -8,12 +8,12 @@ from app.main import create_app
 
 
 @pytest.fixture
-def test_settings() -> Settings:
+def test_settings(tmp_path) -> Settings:
     return Settings(
         app_env="test",
         require_https=False,
         embedded_scheduler=False,
-        mysql_dsn="sqlite+aiosqlite:///:memory:",
+        mysql_dsn=f"sqlite+aiosqlite:///{tmp_path / 'scheduler.sqlite3'}",
         delay_shard_count=4,
         flusher_batch_size=50,
         flusher_flush_interval_ms=20,
@@ -25,7 +25,8 @@ def test_settings() -> Settings:
 @pytest.fixture
 async def app_bundle(test_settings: Settings):
     fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=False)
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    # Auth requests and the background flusher need separate DB connections.
+    engine = create_async_engine(test_settings.mysql_dsn)
     app = create_app(settings=test_settings, redis_client=fake_redis, db_engine=engine)
 
     async with app.router.lifespan_context(app):
