@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     retry_base_delay_ms: int = 1000
     max_query_span_days: int = 7
 
+    delivery_dispatch_interval_ms: int = 100
+    delivery_reconcile_interval_ms: int = 2000
+    delivery_batch_size: int = 100
+    default_artifact_retention_seconds: int = 604800
+    default_e2e_timeout_seconds: int = 3600
+    delivery_config_json: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:

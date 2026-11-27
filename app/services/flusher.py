@@ -46,7 +46,11 @@ class AsyncFlusher:
             key = (rec["task_id"], rec["created_at"])
             merged[key] = rec
 
-        rows = list(merged.values())
+        rows = [
+            rec for rec in merged.values() if rec.get("task_kind", "normal") == "normal"
+        ]
+        if not rows:
+            return
         FLUSHER_BATCH_HISTOGRAM.observe(len(rows))
 
         update_cols = [
@@ -64,15 +68,28 @@ class AsyncFlusher:
         with FLUSHER_DURATION.time():
             async with self.session_factory() as session:
                 if dialect == "mysql":
+                    from sqlalchemy import case
+
                     stmt = mysql_insert(TaskRecord).values(rows)
+                    is_protected = (TaskRecord.task_kind != "normal") | (
+                        TaskRecord.status.in_(["SUCCEEDED", "DEAD"])
+                    )
                     upsert_stmt = stmt.on_duplicate_key_update(
-                        **{col: stmt.inserted[col] for col in update_cols}
+                        **{
+                            col: case(
+                                (is_protected, getattr(TaskRecord, col)),
+                                else_=stmt.inserted[col],
+                            )
+                            for col in update_cols
+                        }
                     )
                 else:
                     stmt = sqlite_insert(TaskRecord).values(rows)
                     upsert_stmt = stmt.on_conflict_do_update(
                         index_elements=["task_id", "created_at"],
                         set_={col: getattr(stmt.excluded, col) for col in update_cols},
+                        where=(TaskRecord.task_kind == "normal")
+                        & TaskRecord.status.notin_(["SUCCEEDED", "DEAD"]),
                     )
                 await session.execute(upsert_stmt)
                 await session.commit()

@@ -33,6 +33,7 @@ for i = 1, #popped, 2 do
             lease_ms = lease_sec * 1000
         end
         local expire_at = now_ms + lease_ms
+        local gen = redis.call("HINCRBY", task_key, "lease_generation", 1)
         redis.call("ZADD", KEYS[2], expire_at, task_id)
         redis.call("HSET", task_key, "status", "RUNNING", "worker_id", worker_id, "pulled_at", now_ms)
         table.insert(results, {
@@ -43,7 +44,8 @@ for i = 1, #popped, 2 do
             vals[4] or "0",
             vals[5] or "3",
             tostring(expire_at),
-            vals[7] or tostring(now_ms)
+            vals[7] or tostring(now_ms),
+            tostring(gen)
         })
     end
 end

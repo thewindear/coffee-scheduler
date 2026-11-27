@@ -3,6 +3,7 @@ import logging
 import time
 from contextlib import suppress
 from datetime import UTC, datetime
+from typing import Any
 
 from croniter import croniter
 from redis.exceptions import LockNotOwnedError
@@ -33,6 +34,8 @@ class SchedulerEngine:
         engine: AsyncEngine,
         session_factory: async_sessionmaker[AsyncSession],
         settings: Settings,
+        delivery_dispatcher: Any | None = None,
+        kafka_publisher: Any | None = None,
     ) -> None:
         self.redis_mgr = redis_mgr
         self.redis = redis_mgr.redis
@@ -41,6 +44,8 @@ class SchedulerEngine:
         self.engine = engine
         self.session_factory = session_factory
         self.settings = settings
+        self.delivery_dispatcher = delivery_dispatcher
+        self.kafka_publisher = kafka_publisher
         self._stop_event = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
 
@@ -84,13 +89,31 @@ class SchedulerEngine:
                 TASKS_NACKED.labels(queue=queue, outcome=outcome).inc()
                 rc = int(_decode(row[2]))
                 wid = _decode(row[3]) or "unknown"
-                if outcome == "DEAD":
-                    snapshot = await self.redis.hgetall(self.redis_mgr.task_key(tid))
+                snapshot = await self.redis.hgetall(self.redis_mgr.task_key(tid))
+                decoded_snap = {_decode(k): _decode(v) for k, v in (snapshot or {}).items()}
+                task_kind = decoded_snap.get("task_kind", "normal")
+                timeout_receipt = {
+                    "error_code": "LEASE_TIMEOUT",
+                    "error_message": "Worker lease expired without heartbeat or ack",
+                }
+                if task_kind in ("collection", "processing"):
+                    async with self.session_factory() as session:
+                        db_row = await self.dispatcher._find_task_record(session, tid)
+                        if db_row is not None and db_row.status not in ("SUCCEEDED", "DEAD"):
+                            db_row.retry_count = rc
+                            db_row.receipt = timeout_receipt
+                            if outcome == "DEAD":
+                                db_row.status = "DEAD"
+                                db_row.finished_at = now_ms
+                            else:
+                                db_row.status = "DELAYED"
+                            await session.commit()
+                elif outcome == "DEAD":
                     await self.dispatcher._enqueue_terminal_flush(
                         tid,
                         snapshot,
                         "DEAD",
-                        {"error_code": "LEASE_TIMEOUT", "error_message": "Worker lease expired without heartbeat or ack"},
+                        timeout_receipt,
                         wid,
                         now_ms,
                         retry_count=rc,
@@ -193,6 +216,38 @@ class SchedulerEngine:
                 name="sched-partitions",
             ),
         ]
+        if self.delivery_dispatcher is not None:
+            self._tasks.append(
+                asyncio.create_task(
+                    self._run_periodic(
+                        "delivery-dispatch",
+                        self.settings.delivery_dispatch_interval_ms,
+                        self.delivery_dispatcher.dispatch_once,
+                    ),
+                    name="sched-delivery-dispatch",
+                )
+            )
+            self._tasks.append(
+                asyncio.create_task(
+                    self._run_periodic(
+                        "delivery-reconcile",
+                        self.settings.delivery_reconcile_interval_ms,
+                        self.delivery_dispatcher.reconcile_once,
+                    ),
+                    name="sched-delivery-reconcile",
+                )
+            )
+        if self.kafka_publisher is not None:
+            self._tasks.append(
+                asyncio.create_task(
+                    self._run_periodic(
+                        "kafka-publish",
+                        self.settings.delivery_dispatch_interval_ms,
+                        self.kafka_publisher.publish_pending_once,
+                    ),
+                    name="sched-kafka-publish",
+                )
+            )
 
     async def stop(self) -> None:
         self._stop_event.set()

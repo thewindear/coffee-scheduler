@@ -6,11 +6,13 @@ from fastapi.responses import Response
 from fastapi.routing import APIRoute
 from starlette.types import Message
 
-from app.api.deps import get_dispatcher
+from app.api.deps import get_dispatcher, get_optional_identity
+from app.core.delivery_config import IdentityConfig
 from app.schemas.tasks import (
     DlqBatchRetryRequest,
     QueueStatsResponse,
     TaskAckRequest,
+    TaskAckResponse,
     TaskBatchSubmitRequest,
     TaskDetailResponse,
     TaskHeartbeatRequest,
@@ -64,25 +66,28 @@ receipt_router = APIRouter(route_class=ReceiptRoute)
 @router.post("/tasks", response_model=TaskSubmitResponse)
 async def submit_task(
     req: TaskSubmitRequest,
+    identity: IdentityConfig | None = Depends(get_optional_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskSubmitResponse:
-    return await dispatcher.submit_task(req)
+    return await dispatcher.submit_task(req, identity=identity)
 
 
 @router.post("/tasks/batch", response_model=list[TaskSubmitResponse])
 async def submit_tasks_batch(
     req: TaskBatchSubmitRequest,
+    identity: IdentityConfig | None = Depends(get_optional_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> list[TaskSubmitResponse]:
-    return await dispatcher.submit_batch(req.tasks)
+    return await dispatcher.submit_batch(req.tasks, identity=identity)
 
 
 @router.post("/tasks/pull", response_model=TaskPullResponse)
 async def pull_tasks(
     req: TaskPullRequest,
+    identity: IdentityConfig | None = Depends(get_optional_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskPullResponse:
-    tasks = await dispatcher.pull_tasks(req)
+    tasks = await dispatcher.pull_tasks(req, identity=identity)
     return TaskPullResponse(tasks=tasks)
 
 
@@ -90,27 +95,30 @@ async def pull_tasks(
 async def heartbeat_task(
     task_id: str,
     req: TaskHeartbeatRequest,
+    identity: IdentityConfig | None = Depends(get_optional_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskHeartbeatResponse:
-    return await dispatcher.heartbeat(task_id, req)
+    return await dispatcher.heartbeat(task_id, req, identity=identity)
 
 
-@receipt_router.post("/tasks/{task_id}/ack")
+@receipt_router.post("/tasks/{task_id}/ack", response_model=TaskAckResponse)
 async def ack_task(
     task_id: str,
     req: TaskAckRequest,
+    identity: IdentityConfig | None = Depends(get_optional_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
-) -> dict[str, str]:
-    return await dispatcher.ack_task(task_id, req)
+) -> TaskAckResponse:
+    return await dispatcher.ack_task(task_id, req, identity=identity)
 
 
 @receipt_router.post("/tasks/{task_id}/nack", response_model=TaskNackResponse)
 async def nack_task(
     task_id: str,
     req: TaskNackRequest,
+    identity: IdentityConfig | None = Depends(get_optional_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskNackResponse:
-    return await dispatcher.nack_task(task_id, req)
+    return await dispatcher.nack_task(task_id, req, identity=identity)
 
 
 @router.get("/tasks/{task_id}", response_model=TaskDetailResponse)
