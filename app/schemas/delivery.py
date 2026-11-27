@@ -48,14 +48,14 @@ class CompletionTrace(BaseModel):
     artifact_deleted: bool = False
 
 
-class CollectionDeliveriesResponse(BaseModel):
-    collection_task_id: str
+class TaskDeliveriesResponse(BaseModel):
+    source_task_id: str
     business_id: str | None = None
     business_request_id: str | None = None
-    collection_type: str | None = None
+    task_type: str | None = None
     status: str
     parent_task_id: str | None = None
-    child_collection_task_ids: list[str] = Field(default_factory=list)
+    child_source_task_ids: list[str] = Field(default_factory=list)
     completion: CompletionTrace | None = None
     deliveries: list[DispatchTraceItem] = Field(default_factory=list)
 
@@ -68,7 +68,7 @@ class RerunStepRequest(BaseModel):
 class RerunStepResponse(BaseModel):
     dispatch_id: str
     processing_task_id: str
-    collection_task_id: str
+    source_task_id: str
     completion_id: str
     recipient_service: str
     step: str
@@ -76,7 +76,7 @@ class RerunStepResponse(BaseModel):
     deduplicated: bool = False
 
 
-class RecollectRequest(BaseModel):
+class SourceRerunRequest(BaseModel):
     idempotency_key: str | None = Field(default=None, max_length=128)
     priority: int | None = Field(default=None, ge=0, le=9)
     delay_seconds: int = Field(default=0, ge=0)
@@ -85,7 +85,7 @@ class RecollectRequest(BaseModel):
 class DeliveryStatsResponse(BaseModel):
     business_id: str | None = None
     recipient_service: str | None = None
-    collection_succeeded_count: int
+    source_succeeded_count: int
     processing_succeeded_count: int
     processing_failed_count: int
     auto_retry_count: int
@@ -102,13 +102,13 @@ class BacklogSegment(BaseModel):
 
 
 class DeliveryBacklogResponse(BaseModel):
-    collection_ready: BacklogSegment
+    source_ready: BacklogSegment
     dispatch_pending: BacklogSegment
     processing_ready: BacklogSegment
 
 
-class CollectionArtifactsResponse(BaseModel):
-    collection_task_id: str
+class TaskArtifactsResponse(BaseModel):
+    source_task_id: str
     completion_id: str
     business_id: str
     artifacts: list[ArtifactRef]

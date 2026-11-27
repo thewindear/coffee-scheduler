@@ -64,8 +64,8 @@ class KafkaCompatPublisher:
                     continue
 
                 # Guard against dual publishing: confirm Kafka handoff on current rule if present
-                ct_cfg = self.registry.get_collection_type(
-                    dispatch.business_id, completion.collection_type
+                ct_cfg = self.registry.get_task_type(
+                    dispatch.business_id, completion.task_type
                 )
                 if ct_cfg is not None:
                     matching_rule = next(
@@ -93,11 +93,11 @@ class KafkaCompatPublisher:
                 topic = dispatch.kafka_topic or f"coffee.delivery.{dispatch.recipient_service}"
                 message = {
                     "delivery_id": dispatch.kafka_delivery_id,
-                    "collection_task_id": dispatch.collection_task_id,
+                    "source_task_id": dispatch.source_task_id,
                     "completion_id": dispatch.completion_id,
                     "business_id": dispatch.business_id,
                     "business_request_id": completion.business_request_id,
-                    "collection_type": completion.collection_type,
+                    "task_type": completion.task_type,
                     "recipient_service": dispatch.recipient_service,
                     "step": dispatch.step,
                     "completed_at_ms": completion.completed_at_ms,
@@ -107,7 +107,7 @@ class KafkaCompatPublisher:
                 try:
                     await self.producer.publish(
                         topic=topic,
-                        key=dispatch.collection_task_id,
+                        key=dispatch.source_task_id,
                         value=message,
                     )
                 except Exception as exc:

@@ -4,10 +4,13 @@ from fastapi import Depends, FastAPI
 from prometheus_fastapi_instrumentator import Instrumentator
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
+from app.api.deps import require_metrics
 from app.api.v1.cron_jobs import router as cron_router
 from app.api.v1.deliveries import router as deliveries_router
 from app.api.v1.tasks import router as tasks_router
+from app.api.v1.workers import router as workers_router
 from app.core.config import Settings, get_settings
 from app.core.db import create_db_engine, create_session_factory, init_db
 from app.core.delivery_config import DeliveryRegistry
@@ -106,11 +109,15 @@ def create_app(
                 await engine.dispose()
 
     application = FastAPI(title="Coffee Scheduler", version="0.1.0", lifespan=lifespan)
+    application.add_middleware(ProxyHeadersMiddleware, trusted_hosts=cfg.trusted_proxy_ips)
+    application.include_router(workers_router)
     application.include_router(tasks_router)
     application.include_router(cron_router)
     application.include_router(deliveries_router)
     Instrumentator().instrument(application).expose(
-        application, endpoint="/metrics", dependencies=[Depends(refresh_queue_metrics)]
+        application,
+        endpoint="/metrics",
+        dependencies=[Depends(require_metrics), Depends(refresh_queue_metrics)],
     )
 
     @application.get("/health", tags=["health"])

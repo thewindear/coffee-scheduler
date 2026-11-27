@@ -7,6 +7,7 @@ import pytest
 from prometheus_client.parser import text_string_to_metric_families
 from sqlalchemy import update
 
+from app.core.access import Identity
 from app.models.tables import CronJob
 from app.schemas.tasks import TaskSubmitRequest
 from app.services.flusher import AsyncFlusher
@@ -50,7 +51,10 @@ async def test_ready_fifo_with_equal_timestamps_and_legacy_scores(app_bundle, mo
 async def test_concurrent_idempotent_submit_returns_one_task(app_bundle):
     app, _, redis, _ = app_bundle
     request = TaskSubmitRequest(queue="dedup", idempotency_key="once")
-    results = await asyncio.gather(*(app.state.dispatcher.submit_task(request) for _ in range(12)))
+    identity = Identity("test-admin", None, True, ())
+    results = await asyncio.gather(
+        *(app.state.dispatcher.submit_task(request, identity=identity) for _ in range(12))
+    )
     assert len({result.task_id for result in results}) == 1
     assert sum(not result.deduplicated for result in results) == 1
     assert await redis.zcard(app.state.redis_mgr.ready_key("dedup")) == 1
@@ -88,6 +92,7 @@ async def test_expired_lease_requeues_after_backoff(app_bundle, monkeypatch):
             json={
                 "queue": "expiry",
                 "worker_id": "initial",
+                "lease_generation": 1,
             },
         )
         assert stale.status_code == 409
@@ -100,7 +105,7 @@ async def test_receipt_limit_counts_raw_bytes_before_schema_validation(app_bundl
     await client.post("/api/v1/tasks/pull", json={"queue": "receipts", "worker_id": "w"})
     task_id = created.json()["task_id"]
     path = f"/api/v1/tasks/{task_id}/{receipt}"
-    raw = b'{"queue":"receipts","worker_id":"w"}'.rjust(16384)
+    raw = b'{"queue":"receipts","worker_id":"w","lease_generation":1}'.rjust(16384)
     headers = {"content-type": "application/json"}
 
     async def chunks():
@@ -136,7 +141,10 @@ async def test_list_accepts_timezone_and_metrics_expose_queue_depth(app_bundle):
     assert (await metrics())[ready_metric] == 1
     pulled = await client.post("/api/v1/tasks/pull", json={"queue": "observed", "worker_id": "w"})
     task_id = pulled.json()["tasks"][0]["task_id"]
-    await client.post(f"/api/v1/tasks/{task_id}/nack", json={"queue": "observed", "worker_id": "w"})
+    await client.post(
+        f"/api/v1/tasks/{task_id}/nack",
+        json={"queue": "observed", "worker_id": "w", "lease_generation": 1},
+    )
     stats = (await client.get("/api/v1/queues/observed/stats")).json()
     assert stats == {
         "queue": "observed",

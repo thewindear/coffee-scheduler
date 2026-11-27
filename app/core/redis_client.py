@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 
 from redis.asyncio import Redis
@@ -36,8 +38,13 @@ class RedisLuaManager:
     def dlq_key(self, queue: str) -> str:
         return f"{self.prefix}:dlq:{queue}"
 
-    def worker_key(self, queue: str, worker_id: str) -> str:
-        return f"{self.prefix}:worker:{queue}:{worker_id}"
+    def worker_pattern(self, queue: str | None = None) -> str:
+        scope = hashlib.sha256(queue.encode()).hexdigest() if queue is not None else "*"
+        return f"{self.prefix}:worker_activity:{scope}:*"
+
+    def worker_key(self, queue: str, service_name: str, worker_id: str) -> str:
+        digest = hashlib.sha256(json.dumps([service_name, worker_id]).encode()).hexdigest()
+        return self.worker_pattern(queue).removesuffix("*") + digest
 
     def active_queues_key(self) -> str:
         return f"{self.prefix}:queues"
@@ -54,5 +61,7 @@ class RedisLuaManager:
             source = lua_path.read_text(encoding="utf-8")
             if name in {"enqueue", "pump"}:
                 source = (LUA_DIR / "_ready.lua").read_text(encoding="utf-8") + "\n" + source
+            if name in {"heartbeat", "ack", "nack", "check_lease"}:
+                source = (LUA_DIR / "_lease.lua").read_text(encoding="utf-8") + "\n" + source
             self._scripts[name] = self.redis.register_script(source)
         return self._scripts[name]
