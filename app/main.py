@@ -4,15 +4,22 @@ from fastapi import Depends, FastAPI
 from prometheus_fastapi_instrumentator import Instrumentator
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
+from app.api.deps import require_metrics
 from app.api.v1.cron_jobs import router as cron_router
+from app.api.v1.deliveries import router as deliveries_router
 from app.api.v1.tasks import router as tasks_router
+from app.api.v1.workers import router as workers_router
 from app.core.config import Settings, get_settings
 from app.core.db import create_db_engine, create_session_factory, init_db
+from app.core.delivery_config import DeliveryRegistry
 from app.core.metrics import refresh_queue_metrics
 from app.core.redis_client import RedisLuaManager
+from app.services.delivery_dispatcher import DeliveryDispatcher
 from app.services.dispatcher import TaskDispatcher
 from app.services.flusher import AsyncFlusher
+from app.services.kafka_publisher import KafkaCompatPublisher
 from app.services.scheduler_loop import SchedulerEngine
 
 
@@ -20,8 +27,10 @@ def create_app(
     settings: Settings | None = None,
     redis_client: Redis | None = None,
     db_engine: AsyncEngine | None = None,
+    delivery_registry: DeliveryRegistry | None = None,
 ) -> FastAPI:
     cfg = settings or get_settings()
+    registry = delivery_registry or DeliveryRegistry(cfg.delivery_config_json)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -47,6 +56,19 @@ def create_app(
             flusher=flusher,
             session_factory=session_factory,
             settings=cfg,
+            registry=registry,
+        )
+        delivery_dispatcher = DeliveryDispatcher(
+            redis_mgr=redis_mgr,
+            dispatcher=dispatcher,
+            session_factory=session_factory,
+            settings=cfg,
+            registry=registry,
+        )
+        kafka_publisher = KafkaCompatPublisher(
+            session_factory=session_factory,
+            registry=registry,
+            batch_size=cfg.delivery_batch_size,
         )
         scheduler = SchedulerEngine(
             redis_mgr=redis_mgr,
@@ -55,6 +77,8 @@ def create_app(
             engine=engine,
             session_factory=session_factory,
             settings=cfg,
+            delivery_dispatcher=delivery_dispatcher,
+            kafka_publisher=kafka_publisher,
         )
 
         app.state.settings = cfg
@@ -63,7 +87,10 @@ def create_app(
         app.state.session_factory = session_factory
         app.state.redis_mgr = redis_mgr
         app.state.flusher = flusher
+        app.state.delivery_registry = registry
         app.state.dispatcher = dispatcher
+        app.state.delivery_dispatcher = delivery_dispatcher
+        app.state.kafka_publisher = kafka_publisher
         app.state.scheduler = scheduler
 
         flusher.start()
@@ -82,10 +109,15 @@ def create_app(
                 await engine.dispose()
 
     application = FastAPI(title="Coffee Scheduler", version="0.1.0", lifespan=lifespan)
+    application.add_middleware(ProxyHeadersMiddleware, trusted_hosts=cfg.trusted_proxy_ips)
+    application.include_router(workers_router)
     application.include_router(tasks_router)
     application.include_router(cron_router)
+    application.include_router(deliveries_router)
     Instrumentator().instrument(application).expose(
-        application, endpoint="/metrics", dependencies=[Depends(refresh_queue_metrics)]
+        application,
+        endpoint="/metrics",
+        dependencies=[Depends(require_metrics), Depends(refresh_queue_metrics)],
     )
 
     @application.get("/health", tags=["health"])

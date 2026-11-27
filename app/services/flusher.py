@@ -2,6 +2,7 @@ import asyncio
 import logging
 from typing import Any
 
+from sqlalchemy import case, func
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -44,35 +45,77 @@ class AsyncFlusher:
         merged: dict[tuple[str, Any], dict[str, Any]] = {}
         for rec in records:
             key = (rec["task_id"], rec["created_at"])
-            merged[key] = rec
+            if key not in merged or rec.get("lease_generation", 0) >= merged[key].get(
+                "lease_generation", 0
+            ):
+                merged[key] = rec
 
-        rows = list(merged.values())
+        rows = [rec for rec in merged.values() if rec.get("task_kind", "normal") == "normal"]
+        if not rows:
+            return
         FLUSHER_BATCH_HISTOGRAM.observe(len(rows))
 
         update_cols = [
-            "status",
             "priority",
             "payload",
             "receipt",
             "retry_count",
             "worker_id",
+            "worker_service",
             "scheduled_at",
             "pulled_at",
             "finished_at",
+            "status",
         ]
         dialect = self.engine.dialect.name
         with FLUSHER_DURATION.time():
             async with self.session_factory() as session:
                 if dialect == "mysql":
                     stmt = mysql_insert(TaskRecord).values(rows)
-                    upsert_stmt = stmt.on_duplicate_key_update(
-                        **{col: stmt.inserted[col] for col in update_cols}
+                    incoming = stmt.inserted
+                    can_update = (TaskRecord.task_kind == "normal") & (
+                        (incoming.lease_generation > TaskRecord.lease_generation)
+                        | (
+                            (incoming.lease_generation == TaskRecord.lease_generation)
+                            & TaskRecord.status.notin_(["SUCCEEDED", "DEAD"])
+                        )
                     )
+                    updates = [
+                        (col, case((can_update, incoming[col]), else_=getattr(TaskRecord, col)))
+                        for col in update_cols
+                    ]
+                    # MySQL evaluates assignments left-to-right. Change status and generation last.
+                    updates.append(
+                        (
+                            "lease_generation",
+                            case(
+                                (
+                                    TaskRecord.task_kind == "normal",
+                                    func.greatest(
+                                        TaskRecord.lease_generation, incoming.lease_generation
+                                    ),
+                                ),
+                                else_=TaskRecord.lease_generation,
+                            ),
+                        )
+                    )
+                    upsert_stmt = stmt.on_duplicate_key_update(updates)
                 else:
                     stmt = sqlite_insert(TaskRecord).values(rows)
                     upsert_stmt = stmt.on_conflict_do_update(
                         index_elements=["task_id", "created_at"],
-                        set_={col: getattr(stmt.excluded, col) for col in update_cols},
+                        set_={
+                            col: getattr(stmt.excluded, col)
+                            for col in [*update_cols, "lease_generation"]
+                        },
+                        where=(TaskRecord.task_kind == "normal")
+                        & (
+                            (stmt.excluded.lease_generation > TaskRecord.lease_generation)
+                            | (
+                                (stmt.excluded.lease_generation == TaskRecord.lease_generation)
+                                & TaskRecord.status.notin_(["SUCCEEDED", "DEAD"])
+                            )
+                        ),
                     )
                 await session.execute(upsert_stmt)
                 await session.commit()

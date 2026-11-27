@@ -6,11 +6,13 @@ from fastapi.responses import Response
 from fastapi.routing import APIRoute
 from starlette.types import Message
 
-from app.api.deps import get_dispatcher
+from app.api.deps import AuthenticatedRoute, bearer, client_ip, get_dispatcher, get_identity
+from app.core.access import Identity
 from app.schemas.tasks import (
     DlqBatchRetryRequest,
     QueueStatsResponse,
     TaskAckRequest,
+    TaskAckResponse,
     TaskBatchSubmitRequest,
     TaskDetailResponse,
     TaskHeartbeatRequest,
@@ -26,7 +28,7 @@ from app.schemas.tasks import (
 )
 from app.services.dispatcher import TaskDispatcher
 
-router = APIRouter(prefix="/api/v1", tags=["tasks"])
+router = APIRouter(prefix="/api/v1", tags=["tasks"], route_class=AuthenticatedRoute)
 
 
 class ReceiptRoute(APIRoute):
@@ -34,6 +36,7 @@ class ReceiptRoute(APIRoute):
         handler = super().get_route_handler()
 
         async def limited_handler(request: Request) -> Response:
+            request.state.identity = await get_identity(request, await bearer(request))
             limit = request.app.state.settings.max_receipt_bytes
             body = bytearray()
             async for chunk in request.stream():
@@ -64,25 +67,29 @@ receipt_router = APIRouter(route_class=ReceiptRoute)
 @router.post("/tasks", response_model=TaskSubmitResponse)
 async def submit_task(
     req: TaskSubmitRequest,
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskSubmitResponse:
-    return await dispatcher.submit_task(req)
+    return await dispatcher.submit_task(req, identity=identity)
 
 
 @router.post("/tasks/batch", response_model=list[TaskSubmitResponse])
 async def submit_tasks_batch(
     req: TaskBatchSubmitRequest,
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> list[TaskSubmitResponse]:
-    return await dispatcher.submit_batch(req.tasks)
+    return await dispatcher.submit_batch(req.tasks, identity=identity)
 
 
 @router.post("/tasks/pull", response_model=TaskPullResponse)
 async def pull_tasks(
     req: TaskPullRequest,
+    request: Request,
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskPullResponse:
-    tasks = await dispatcher.pull_tasks(req)
+    tasks = await dispatcher.pull_tasks(req, identity=identity, ip=client_ip(request))
     return TaskPullResponse(tasks=tasks)
 
 
@@ -90,35 +97,40 @@ async def pull_tasks(
 async def heartbeat_task(
     task_id: str,
     req: TaskHeartbeatRequest,
+    request: Request,
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskHeartbeatResponse:
-    return await dispatcher.heartbeat(task_id, req)
+    return await dispatcher.heartbeat(task_id, req, identity=identity, ip=client_ip(request))
 
 
-@receipt_router.post("/tasks/{task_id}/ack")
+@receipt_router.post("/tasks/{task_id}/ack", response_model=TaskAckResponse)
 async def ack_task(
     task_id: str,
     req: TaskAckRequest,
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
-) -> dict[str, str]:
-    return await dispatcher.ack_task(task_id, req)
+) -> TaskAckResponse:
+    return await dispatcher.ack_task(task_id, req, identity=identity)
 
 
 @receipt_router.post("/tasks/{task_id}/nack", response_model=TaskNackResponse)
 async def nack_task(
     task_id: str,
     req: TaskNackRequest,
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskNackResponse:
-    return await dispatcher.nack_task(task_id, req)
+    return await dispatcher.nack_task(task_id, req, identity=identity)
 
 
 @router.get("/tasks/{task_id}", response_model=TaskDetailResponse)
 async def get_task(
     task_id: str,
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskDetailResponse:
-    return await dispatcher.get_task(task_id)
+    return await dispatcher.get_task(task_id, identity)
 
 
 @router.get("/tasks", response_model=TaskListResponse)
@@ -130,9 +142,11 @@ async def list_tasks(
     end_time: datetime | None = Query(default=None),
     cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=100),
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskListResponse:
     return await dispatcher.list_tasks(
+        identity=identity,
         queue=queue,
         status_filter=status,
         worker_id=worker_id,
@@ -146,27 +160,40 @@ async def list_tasks(
 @router.get("/queues/{queue}/stats", response_model=QueueStatsResponse)
 async def get_queue_stats(
     queue: str,
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> QueueStatsResponse:
-    return await dispatcher.get_queue_stats(queue)
+    return await dispatcher.get_queue_stats(queue, identity)
 
 
 @router.post("/tasks/{task_id}/retry", response_model=TaskSubmitResponse)
 async def retry_task(
     task_id: str,
     req: TaskRetryRequest | None = None,
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> TaskSubmitResponse:
-    return await dispatcher.retry_task(task_id, req or TaskRetryRequest())
+    return await dispatcher.retry_task(task_id, req or TaskRetryRequest(), identity)
+
+
+@router.get("/dlq/{queue}", response_model=list[TaskDetailResponse])
+async def list_dlq(
+    queue: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    identity: Identity = Depends(get_identity),
+    dispatcher: TaskDispatcher = Depends(get_dispatcher),
+) -> list[TaskDetailResponse]:
+    return await dispatcher.list_dlq(queue, limit, identity)
 
 
 @router.post("/dlq/{queue}/retry", response_model=list[TaskSubmitResponse])
 async def retry_dlq_batch(
     queue: str,
     req: DlqBatchRetryRequest | None = None,
+    identity: Identity = Depends(get_identity),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> list[TaskSubmitResponse]:
-    return await dispatcher.retry_dlq_batch(queue, req or DlqBatchRetryRequest())
+    return await dispatcher.retry_dlq_batch(queue, req or DlqBatchRetryRequest(), identity)
 
 
 router.include_router(receipt_router)

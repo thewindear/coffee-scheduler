@@ -35,7 +35,12 @@ async def test_submit_pull_heartbeat_ack_with_artifacts(app_bundle):
     # 3. Heartbeat
     hb = await client.post(
         f"/api/v1/tasks/{task_id}/heartbeat",
-        json={"queue": "spider", "worker_id": "crawler-1", "extend_seconds": 120},
+        json={
+            "queue": "spider",
+            "worker_id": "crawler-1",
+            "extend_seconds": 120,
+            "lease_generation": pulled[0]["lease_generation"],
+        },
     )
     assert hb.status_code == 200
     assert hb.json()["lease_expire_at_ms"] > int(time.time() * 1000)
@@ -46,6 +51,7 @@ async def test_submit_pull_heartbeat_ack_with_artifacts(app_bundle):
         json={
             "queue": "spider",
             "worker_id": "crawler-1",
+            "lease_generation": pulled[0]["lease_generation"],
             "duration_ms": 340,
             "summary": {"count": 100},
             "artifacts": [
@@ -145,7 +151,9 @@ async def test_ack_payload_size_limit(app_bundle):
     _, client, _, _ = app_bundle
     r = await client.post("/api/v1/tasks", json={"queue": "size_q", "payload": {}})
     tid = r.json()["task_id"]
-    await client.post("/api/v1/tasks/pull", json={"queue": "size_q", "worker_id": "w1", "batch_size": 1})
+    await client.post(
+        "/api/v1/tasks/pull", json={"queue": "size_q", "worker_id": "w1", "batch_size": 1}
+    )
 
     huge_ack = await client.post(
         f"/api/v1/tasks/{tid}/ack",

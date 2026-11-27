@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
+from app.core.access import Grant, Identity
 from app.core.config import Settings, get_settings
 from app.main import create_app
 from app.models.tables import TaskRecord
@@ -47,12 +48,19 @@ async def main() -> None:
     try:
         async with app.router.lifespan_context(app):
             dispatcher = app.state.dispatcher
+            identity = Identity(
+                "local-benchmark",
+                None,
+                False,
+                tuple(Grant(operation, queue=queue) for operation in ("submit", "pull", "monitor")),
+            )
 
             async def produce(offset: int) -> list[str]:
                 ids = []
                 for i in range(offset, args.tasks, args.producers):
                     task = await dispatcher.submit_task(
-                        TaskSubmitRequest(queue=queue, payload={"i": i}, priority=i % 10)
+                        TaskSubmitRequest(queue=queue, payload={"i": i}, priority=i % 10),
+                        identity=identity,
                     )
                     ids.append(task.task_id)
                 return ids
@@ -60,11 +68,13 @@ async def main() -> None:
             async def consume(index: int) -> list[str]:
                 worker_id = f"bench-{index}"
                 pull = TaskPullRequest(queue=queue, worker_id=worker_id, batch_size=args.batch)
-                ack = TaskAckRequest(queue=queue, worker_id=worker_id)
                 ids = []
-                while tasks := await dispatcher.pull_tasks(pull):
+                while tasks := await dispatcher.pull_tasks(pull, identity=identity):
                     for task in tasks:
-                        await dispatcher.ack_task(task.task_id, ack)
+                        ack = TaskAckRequest(
+                            queue=queue, worker_id=worker_id, lease_generation=task.lease_generation
+                        )
+                        await dispatcher.ack_task(task.task_id, ack, identity=identity)
                         ids.append(task.task_id)
                 return ids
 
@@ -87,7 +97,7 @@ async def main() -> None:
                         )
                     )
                 ).all()
-            stats = await dispatcher.get_queue_stats(queue)
+            stats = await dispatcher.get_queue_stats(queue, identity)
     finally:
         if redis is not None:
             await redis.aclose()

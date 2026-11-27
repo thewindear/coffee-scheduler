@@ -3,19 +3,22 @@ import logging
 import time
 from contextlib import suppress
 from datetime import UTC, datetime
+from typing import Any
 
 from croniter import croniter
+from fastapi import HTTPException
 from redis.exceptions import LockNotOwnedError
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.core.access import load_identity
 from app.core.config import Settings
 from app.core.db import ensure_task_records_partitions
 from app.core.metrics import TASKS_NACKED
 from app.core.redis_client import RedisLuaManager
-from app.models.tables import CronJob
+from app.models.tables import CronJob, ServiceIdentity
 from app.schemas.tasks import TaskSubmitRequest
-from app.services.dispatcher import TaskDispatcher, _decode
+from app.services.dispatcher import TaskDispatcher, _decode, _task_kind
 from app.services.flusher import AsyncFlusher
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,8 @@ class SchedulerEngine:
         engine: AsyncEngine,
         session_factory: async_sessionmaker[AsyncSession],
         settings: Settings,
+        delivery_dispatcher: Any | None = None,
+        kafka_publisher: Any | None = None,
     ) -> None:
         self.redis_mgr = redis_mgr
         self.redis = redis_mgr.redis
@@ -41,6 +46,8 @@ class SchedulerEngine:
         self.engine = engine
         self.session_factory = session_factory
         self.settings = settings
+        self.delivery_dispatcher = delivery_dispatcher
+        self.kafka_publisher = kafka_publisher
         self._stop_event = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
 
@@ -84,13 +91,38 @@ class SchedulerEngine:
                 TASKS_NACKED.labels(queue=queue, outcome=outcome).inc()
                 rc = int(_decode(row[2]))
                 wid = _decode(row[3]) or "unknown"
-                if outcome == "DEAD":
-                    snapshot = await self.redis.hgetall(self.redis_mgr.task_key(tid))
+                snapshot = await self.redis.hgetall(self.redis_mgr.task_key(tid))
+                decoded_snap = {_decode(k): _decode(v) for k, v in (snapshot or {}).items()}
+                task_kind = _task_kind(decoded_snap.get("task_kind", "normal"))
+                timeout_receipt = {
+                    "error_code": "LEASE_TIMEOUT",
+                    "error_message": "Worker lease expired without heartbeat or ack",
+                }
+                if task_kind in ("source", "processing"):
+                    async with self.session_factory.begin() as session:
+                        db_row = await self.dispatcher._find_task_record(session, tid, lock=True)
+                        if (
+                            db_row is not None
+                            and db_row.status not in ("SUCCEEDED", "DEAD")
+                            and db_row.lease_generation <= int(row[4])
+                        ):
+                            db_row.lease_generation = int(row[4])
+                            db_row.worker_id = wid
+                            db_row.worker_service = _decode(row[6]) or None
+                            db_row.retry_count = rc
+                            db_row.receipt = timeout_receipt
+                            if outcome == "DEAD":
+                                db_row.status = "DEAD"
+                                db_row.finished_at = now_ms
+                            else:
+                                db_row.status = "DELAYED"
+                                db_row.scheduled_at = int(row[5])
+                elif outcome == "DEAD":
                     await self.dispatcher._enqueue_terminal_flush(
                         tid,
                         snapshot,
                         "DEAD",
-                        {"error_code": "LEASE_TIMEOUT", "error_message": "Worker lease expired without heartbeat or ack"},
+                        timeout_receipt,
                         wid,
                         now_ms,
                         retry_count=rc,
@@ -128,32 +160,53 @@ class SchedulerEngine:
         now_dt = datetime.fromtimestamp(now_ms / 1000.0, tz=UTC)
         triggered = 0
         async with self.session_factory() as session:
-            stmt = select(CronJob).where(CronJob.enabled.is_(True), CronJob.next_run_at <= now_ms)
-            jobs = (await session.execute(stmt)).scalars().all()
-            for job in jobs:
-                next_dt = croniter(job.cron_expr, now_dt).get_next(datetime)
-                next_ms = int(next_dt.timestamp() * 1000)
-                upd = (
-                    update(CronJob)
-                    .where(CronJob.id == job.id, CronJob.version == job.version)
-                    .values(next_run_at=next_ms, version=job.version + 1)
-                )
-                res = await session.execute(upd)
-                if res.rowcount == 1:
-                    await self.dispatcher.submit_task(
-                        TaskSubmitRequest(
-                            queue=job.queue,
-                            payload=job.payload,
-                            priority=job.priority,
-                            max_retries=job.max_retries,
-                            lease_seconds=job.lease_seconds,
-                        ),
-                        cron_occurrence=(job.id, job.next_run_at),
+            ids = (
+                await session.scalars(
+                    select(CronJob.id).where(
+                        CronJob.enabled.is_(True), CronJob.next_run_at <= now_ms
                     )
-                    await session.commit()
-                    triggered += 1
-                else:
-                    await session.rollback()
+                )
+            ).all()
+        for job_id in ids:
+            async with self.session_factory.begin() as session:
+                job = await session.get(CronJob, job_id, with_for_update=True)
+                if job is None or not job.enabled or job.next_run_at > now_ms:
+                    continue
+                due_at = job.next_run_at
+                next_dt = croniter(job.cron_expr, now_dt).get_next(datetime)
+                job.next_run_at = int(next_dt.timestamp() * 1000)
+                job.version += 1
+                owner = (
+                    await session.get(ServiceIdentity, job.owner_service, with_for_update=True)
+                    if job.owner_service
+                    else None
+                )
+                if owner is None:
+                    continue
+                identity = await load_identity(session, owner, lock=True)
+                request = TaskSubmitRequest(
+                    queue=job.queue,
+                    business_id=job.business_id,
+                    payload=job.payload,
+                    priority=job.priority,
+                    max_retries=job.max_retries,
+                    lease_seconds=job.lease_seconds,
+                )
+                try:
+                    route = await self.dispatcher.submission_route(
+                        request, identity, session, use_home_business=False
+                    )
+                except HTTPException as exc:
+                    if exc.status_code != 403:
+                        raise
+                    continue
+                await self.dispatcher.submit_task(
+                    request,
+                    identity=identity,
+                    cron_occurrence=(job.id, due_at),
+                    route=route,
+                )
+                triggered += 1
         return triggered
 
     async def _run_periodic(self, name: str, interval_ms: int, coro_fn) -> None:
@@ -169,7 +222,9 @@ class SchedulerEngine:
                 pass
 
     async def _maintain_partitions(self) -> None:
-        await ensure_task_records_partitions(self.engine, days_ahead=self.settings.partition_precreate_days)
+        await ensure_task_records_partitions(
+            self.engine, days_ahead=self.settings.partition_precreate_days
+        )
 
     def start(self) -> None:
         if self._tasks:
@@ -185,7 +240,9 @@ class SchedulerEngine:
                 name="sched-reap",
             ),
             asyncio.create_task(
-                self._run_periodic("cron", self.settings.cron_scan_interval_ms, self.scan_cron_once),
+                self._run_periodic(
+                    "cron", self.settings.cron_scan_interval_ms, self.scan_cron_once
+                ),
                 name="sched-cron",
             ),
             asyncio.create_task(
@@ -193,6 +250,38 @@ class SchedulerEngine:
                 name="sched-partitions",
             ),
         ]
+        if self.delivery_dispatcher is not None:
+            self._tasks.append(
+                asyncio.create_task(
+                    self._run_periodic(
+                        "delivery-dispatch",
+                        self.settings.delivery_dispatch_interval_ms,
+                        self.delivery_dispatcher.dispatch_once,
+                    ),
+                    name="sched-delivery-dispatch",
+                )
+            )
+            self._tasks.append(
+                asyncio.create_task(
+                    self._run_periodic(
+                        "delivery-reconcile",
+                        self.settings.delivery_reconcile_interval_ms,
+                        self.delivery_dispatcher.reconcile_once,
+                    ),
+                    name="sched-delivery-reconcile",
+                )
+            )
+        if self.kafka_publisher is not None:
+            self._tasks.append(
+                asyncio.create_task(
+                    self._run_periodic(
+                        "kafka-publish",
+                        self.settings.delivery_dispatch_interval_ms,
+                        self.kafka_publisher.publish_pending_once,
+                    ),
+                    name="sched-kafka-publish",
+                )
+            )
 
     async def stop(self) -> None:
         self._stop_event.set()

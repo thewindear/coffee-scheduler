@@ -1,11 +1,15 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+TaskKind = Literal["normal", "source", "processing"]
 
 
 class TaskSubmitRequest(BaseModel):
-    queue: str = Field(..., min_length=1, max_length=64)
+    model_config = ConfigDict(extra="forbid")
+
+    queue: str | None = Field(default=None, min_length=1, max_length=64)
     payload: dict[str, Any] = Field(default_factory=dict)
     priority: int = Field(default=5, ge=0, le=9)
     delay_seconds: int = Field(default=0, ge=0)
@@ -13,6 +17,18 @@ class TaskSubmitRequest(BaseModel):
     max_retries: int = Field(default=3, ge=0, le=20)
     lease_seconds: int = Field(default=60, ge=1, le=86400)
     idempotency_key: str | None = Field(default=None, max_length=128)
+    task_type: str | None = Field(default=None, min_length=1, max_length=64)
+    business_id: str | None = Field(default=None, min_length=1, max_length=64)
+    business_request_id: str | None = Field(default=None, max_length=128)
+    recipient_services: list[str] | None = Field(default=None)
+
+    @model_validator(mode="after")
+    def _validate_queue_or_task_type(self) -> "TaskSubmitRequest":
+        if (self.queue is None) == (self.task_type is None):
+            raise ValueError("Provide exactly one of 'queue' and 'task_type'")
+        if self.recipient_services and not self.task_type:
+            raise ValueError("Additional recipients require a task_type")
+        return self
 
 
 class TaskBatchSubmitRequest(BaseModel):
@@ -24,6 +40,15 @@ class TaskSubmitResponse(BaseModel):
     queue: str
     status: str
     deduplicated: bool = False
+    task_kind: TaskKind = "normal"
+    business_id: str | None = None
+    task_type: str | None = None
+
+
+class ArtifactRef(BaseModel):
+    storage: str = Field(..., min_length=1, max_length=32)
+    uri: str = Field(..., min_length=1, max_length=1024)
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class TaskPullRequest(BaseModel):
@@ -41,6 +66,14 @@ class PulledTask(BaseModel):
     max_retries: int
     lease_expire_at_ms: int
     scheduled_at_ms: int
+    lease_generation: int = 0
+    task_kind: TaskKind = "normal"
+    task_type: str | None = None
+    source_task_id: str | None = None
+    completion_id: str | None = None
+    step: str | None = None
+    recipient_service: str | None = None
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
 
 
 class TaskPullResponse(BaseModel):
@@ -51,17 +84,13 @@ class TaskHeartbeatRequest(BaseModel):
     queue: str = Field(..., min_length=1, max_length=64)
     worker_id: str = Field(..., min_length=1, max_length=128)
     extend_seconds: int | None = Field(default=None, ge=1, le=86400)
+    lease_generation: int = Field(ge=1)
 
 
 class TaskHeartbeatResponse(BaseModel):
     task_id: str
     lease_expire_at_ms: int
-
-
-class ArtifactRef(BaseModel):
-    storage: str = Field(..., min_length=1, max_length=32)
-    uri: str = Field(..., min_length=1, max_length=1024)
-    meta: dict[str, Any] = Field(default_factory=dict)
+    lease_generation: int = 0
 
 
 class TaskAckRequest(BaseModel):
@@ -71,6 +100,17 @@ class TaskAckRequest(BaseModel):
     summary: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     extra: dict[str, Any] = Field(default_factory=dict)
+    lease_generation: int = Field(ge=1)
+    processing_result: dict[str, Any] | None = None
+
+
+class TaskAckResponse(BaseModel):
+    task_id: str
+    status: str
+    completion_id: str | None = None
+    lease_generation: int | None = None
+    replayed: bool = False
+    dispatch_count: int = 0
 
 
 class TaskNackRequest(BaseModel):
@@ -79,6 +119,7 @@ class TaskNackRequest(BaseModel):
     error_code: str = Field(default="EXECUTION_ERROR", max_length=64)
     error_message: str = Field(default="", max_length=4096)
     retryable: bool = True
+    lease_generation: int = Field(ge=1)
 
 
 class TaskNackResponse(BaseModel):
@@ -113,6 +154,18 @@ class TaskDetailResponse(BaseModel):
     finished_at_ms: int | None = None
     created_at: datetime | None = None
     source: str
+    task_kind: TaskKind = "normal"
+    business_id: str | None = None
+    business_request_id: str | None = None
+    task_type: str | None = None
+    lease_generation: int = 0
+    source_task_id: str | None = None
+    completion_id: str | None = None
+    recipient_service: str | None = None
+    step: str | None = None
+    parent_task_id: str | None = None
+    rerun_of_task_id: str | None = None
+    processing_result: dict[str, Any] | None = None
 
 
 class TaskListResponse(BaseModel):

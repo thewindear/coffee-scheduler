@@ -18,6 +18,9 @@ dependencies = [
     "prometheus-client>=0.21.0",
 ]
 
+[project.scripts]
+coffee-scheduler-admin = "app.admin:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3.0",
@@ -32,6 +35,7 @@ dev = [
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+pythonpath = ["sdk/python"]
 
 [tool.ruff]
 line-length = 100

@@ -13,12 +13,15 @@ async def test_nack_retry_dlq_and_batch_retry(app_bundle):
     tid = r.json()["task_id"]
 
     # First pull -> nack(retryable=True) -> RETRY
-    await client.post("/api/v1/tasks/pull", json={"queue": "dlq_q", "worker_id": "w1", "batch_size": 1})
+    await client.post(
+        "/api/v1/tasks/pull", json={"queue": "dlq_q", "worker_id": "w1", "batch_size": 1}
+    )
     n1 = await client.post(
         f"/api/v1/tasks/{tid}/nack",
         json={
             "queue": "dlq_q",
             "worker_id": "w1",
+            "lease_generation": 1,
             "error_code": "TIMEOUT",
             "error_message": "upstream 504",
             "retryable": True,
@@ -33,12 +36,15 @@ async def test_nack_retry_dlq_and_batch_retry(app_bundle):
     await app.state.scheduler.pump_once()
 
     # Second pull -> nack -> DEAD
-    await client.post("/api/v1/tasks/pull", json={"queue": "dlq_q", "worker_id": "w1", "batch_size": 1})
+    await client.post(
+        "/api/v1/tasks/pull", json={"queue": "dlq_q", "worker_id": "w1", "batch_size": 1}
+    )
     n2 = await client.post(
         f"/api/v1/tasks/{tid}/nack",
         json={
             "queue": "dlq_q",
             "worker_id": "w1",
+            "lease_generation": 2,
             "error_code": "TIMEOUT",
             "error_message": "still 504",
             "retryable": True,
@@ -52,12 +58,15 @@ async def test_nack_retry_dlq_and_batch_retry(app_bundle):
         json={"queue": "dlq_q", "payload": {"url": "404"}, "max_retries": 5},
     )
     tid_fast = r_fast.json()["task_id"]
-    await client.post("/api/v1/tasks/pull", json={"queue": "dlq_q", "worker_id": "w1", "batch_size": 1})
+    await client.post(
+        "/api/v1/tasks/pull", json={"queue": "dlq_q", "worker_id": "w1", "batch_size": 1}
+    )
     nf = await client.post(
         f"/api/v1/tasks/{tid_fast}/nack",
         json={
             "queue": "dlq_q",
             "worker_id": "w1",
+            "lease_generation": 1,
             "error_code": "NOT_FOUND",
             "error_message": "404",
             "retryable": False,
@@ -91,10 +100,17 @@ async def test_lease_reap_cold_hot_lookup_and_cursor_pagination(app_bundle):
         r = await client.post("/api/v1/tasks", json={"queue": "page_q", "payload": {"idx": idx}})
         tid = r.json()["task_id"]
         tids.append(tid)
-        await client.post("/api/v1/tasks/pull", json={"queue": "page_q", "worker_id": "w1", "batch_size": 1})
+        await client.post(
+            "/api/v1/tasks/pull", json={"queue": "page_q", "worker_id": "w1", "batch_size": 1}
+        )
         await client.post(
             f"/api/v1/tasks/{tid}/ack",
-            json={"queue": "page_q", "worker_id": "w1", "summary": {"idx": idx}},
+            json={
+                "queue": "page_q",
+                "worker_id": "w1",
+                "lease_generation": 1,
+                "summary": {"idx": idx},
+            },
         )
 
     await app.state.flusher.drain_once()
@@ -111,7 +127,9 @@ async def test_lease_reap_cold_hot_lookup_and_cursor_pagination(app_bundle):
     assert p1["next_cursor"] is not None
 
     p2 = (
-        await client.get(f"/api/v1/tasks?queue=page_q&status=SUCCEEDED&limit=2&cursor={p1['next_cursor']}")
+        await client.get(
+            f"/api/v1/tasks?queue=page_q&status=SUCCEEDED&limit=2&cursor={p1['next_cursor']}"
+        )
     ).json()
     assert len(p2["items"]) == 1
     assert p2["next_cursor"] is None
@@ -122,9 +140,13 @@ async def test_lease_reap_cold_hot_lookup_and_cursor_pagination(app_bundle):
         json={"queue": "reap_q", "payload": {}, "max_retries": 0, "lease_seconds": 1},
     )
     tid_exp = r_exp.json()["task_id"]
-    await client.post("/api/v1/tasks/pull", json={"queue": "reap_q", "worker_id": "w-dead", "batch_size": 1})
+    await client.post(
+        "/api/v1/tasks/pull", json={"queue": "reap_q", "worker_id": "w-dead", "batch_size": 1}
+    )
     # Force lease score into the past
-    await fake_redis.zadd(app.state.redis_mgr.lease_key("reap_q"), {tid_exp: int(time.time() * 1000) - 1000})
+    await fake_redis.zadd(
+        app.state.redis_mgr.lease_key("reap_q"), {tid_exp: int(time.time() * 1000) - 1000}
+    )
     reaped = await app.state.scheduler.reap_once()
     assert reaped == 1
     dead_detail = (await client.get(f"/api/v1/tasks/{tid_exp}")).json()
@@ -155,7 +177,9 @@ async def test_cron_job_crud_and_trigger(app_bundle):
 
     async with app.state.session_factory() as session:
         await session.execute(
-            update(CronJob).where(CronJob.id == job_id).values(next_run_at=int(time.time() * 1000) - 1000)
+            update(CronJob)
+            .where(CronJob.id == job_id)
+            .values(next_run_at=int(time.time() * 1000) - 1000)
         )
         await session.commit()
 

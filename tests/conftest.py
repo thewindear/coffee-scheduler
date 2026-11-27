@@ -11,6 +11,7 @@ from app.main import create_app
 def test_settings() -> Settings:
     return Settings(
         app_env="test",
+        require_https=False,
         embedded_scheduler=False,
         mysql_dsn="sqlite+aiosqlite:///:memory:",
         delay_shard_count=4,
@@ -28,9 +29,25 @@ async def app_bundle(test_settings: Settings):
     app = create_app(settings=test_settings, redis_client=fake_redis, db_engine=engine)
 
     async with app.router.lifespan_context(app):
+        _, headers = await seed_service(app, "test-admin", administrator=True)
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", headers=headers
+        ) as client:
             yield app, client, fake_redis, engine
 
     await fake_redis.aclose()
     await engine.dispose()
+
+
+async def seed_service(app, name, business=None, grants=(), *, administrator=False):
+    from app.core.access import issue_credential, set_grant
+    from app.models.tables import ServiceIdentity
+
+    async with app.state.session_factory.begin() as session:
+        session.add(ServiceIdentity(name=name, business_id=business, administrator=administrator))
+        await session.flush()
+        for grant in grants:
+            await set_grant(session, name, grant)
+        credential_id, token = issue_credential(session, name)
+    return credential_id, {"Authorization": f"Bearer {token}"}

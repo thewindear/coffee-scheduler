@@ -1,30 +1,14 @@
--- KEYS[1]: cs:lease:{queue}
--- KEYS[2]: cs:task:{task_id}
--- KEYS[3]: cs:delay:{shard}
--- KEYS[4]: cs:dlq:{queue}
--- ARGV[1]: task_id
--- ARGV[2]: now_ms
--- ARGV[3]: retryable ("1" or "0")
--- ARGV[4]: base_delay_ms
--- ARGV[5]: hash_ttl_sec
--- ARGV[6]: receipt_json
--- ARGV[7]: worker_id
-local task_id = ARGV[1]
-local now_ms = tonumber(ARGV[2])
-local retryable = ARGV[3]
-local base_delay_ms = tonumber(ARGV[4])
-local hash_ttl_sec = tonumber(ARGV[5])
-local receipt_json = ARGV[6]
-local worker_id = ARGV[7]
-
-local vals = redis.call("HMGET", KEYS[2], "status", "retry_count", "max_retries", "worker_id")
-local expires_at = tonumber(redis.call("ZSCORE", KEYS[1], task_id))
-if vals[1] ~= "RUNNING" or vals[4] ~= worker_id or not expires_at or expires_at <= now_ms then
-    return {"IGNORED", 0, 0}
+-- KEYS: lease queue, task hash, delay shard, dead letter queue
+-- ARGV: task ID, queue, service, worker ID, generation, now, retryable, retry delay, hash TTL, receipt
+local task_id, worker_id, now_ms = ARGV[1], ARGV[4], tonumber(ARGV[6])
+local retryable, base_delay_ms, hash_ttl_sec, receipt_json = ARGV[7], tonumber(ARGV[8]), tonumber(ARGV[9]), ARGV[10]
+local owned = lease_status(KEYS[1], KEYS[2], task_id, ARGV[2], ARGV[3], worker_id, ARGV[5], now_ms)
+if owned ~= 1 then
+    return {owned == -1 and "FORBIDDEN" or "IGNORED", 0, 0}
 end
-
-local retry_count = tonumber(vals[2]) or 0
-local max_retries = tonumber(vals[3]) or 3
+local vals = redis.call("HMGET", KEYS[2], "retry_count", "max_retries")
+local retry_count = tonumber(vals[1]) or 0
+local max_retries = tonumber(vals[2]) or 3
 
 redis.call("ZREM", KEYS[1], task_id)
 

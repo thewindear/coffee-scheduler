@@ -5,14 +5,18 @@ from redis.asyncio import Redis
 
 from app.core.config import get_settings
 from app.core.db import create_db_engine, create_session_factory, init_db
+from app.core.delivery_config import DeliveryRegistry
 from app.core.redis_client import RedisLuaManager
+from app.services.delivery_dispatcher import DeliveryDispatcher
 from app.services.dispatcher import TaskDispatcher
 from app.services.flusher import AsyncFlusher
+from app.services.kafka_publisher import KafkaCompatPublisher
 from app.services.scheduler_loop import SchedulerEngine
 
 
 async def run_worker_scheduler() -> None:
     cfg = get_settings()
+    registry = DeliveryRegistry(cfg.delivery_config_json)
     r_client = Redis.from_url(cfg.redis_url, decode_responses=False)
     engine = create_db_engine(cfg)
     await init_db(engine, days_ahead=cfg.partition_precreate_days)
@@ -32,6 +36,19 @@ async def run_worker_scheduler() -> None:
         flusher=flusher,
         session_factory=session_factory,
         settings=cfg,
+        registry=registry,
+    )
+    delivery_dispatcher = DeliveryDispatcher(
+        redis_mgr=redis_mgr,
+        dispatcher=dispatcher,
+        session_factory=session_factory,
+        settings=cfg,
+        registry=registry,
+    )
+    kafka_publisher = KafkaCompatPublisher(
+        session_factory=session_factory,
+        registry=registry,
+        batch_size=cfg.delivery_batch_size,
     )
     scheduler = SchedulerEngine(
         redis_mgr=redis_mgr,
@@ -40,6 +57,8 @@ async def run_worker_scheduler() -> None:
         engine=engine,
         session_factory=session_factory,
         settings=cfg,
+        delivery_dispatcher=delivery_dispatcher,
+        kafka_publisher=kafka_publisher,
     )
 
     stop_event = asyncio.Event()
